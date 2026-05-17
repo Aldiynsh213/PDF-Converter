@@ -1,233 +1,197 @@
-const express = require("express");
-const multer = require("multer");
-const cors = require("cors");
-const path = require("path");
-const fs = require("fs");
-const { execFile } = require("child_process");
-const archiver = require("archiver");
+const express = require('express');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
+const { execFile } = require('child_process');
+const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-app.use(cors());
-app.use(express.static("public"));
+const PORT = process.env.PORT || 7860;
+const HOST = '0.0.0.0';
+const LIBREOFFICE_PATH = process.env.LIBREOFFICE_PATH || 'soffice';
 
-const uploadDir = path.resolve("uploads");
-const outputDir = path.resolve("output");
+const ROOT_DIR = __dirname;
+const PUBLIC_DIR = path.join(ROOT_DIR, 'public');
+const UPLOAD_DIR = path.join(ROOT_DIR, 'uploads');
+const CONVERTED_DIR = path.join(ROOT_DIR, 'converted');
 
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-if (!fs.existsSync(outputDir)) fs.mkdirSync(outputDir);
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+fs.mkdirSync(CONVERTED_DIR, { recursive: true });
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.use(express.static(PUBLIC_DIR));
+app.use('/converted', express.static(CONVERTED_DIR));
+
+function safeFileName(name) {
+  const ext = path.extname(name);
+  const base = path
+    .basename(name, ext)
+    .replace(/[^a-zA-Z0-9-_]/g, '-')
+    .replace(/-+/g, '-')
+    .slice(0, 60);
+
+  const id = crypto.randomBytes(6).toString('hex');
+  return `${base || 'file'}-${id}${ext}`;
+}
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, UPLOAD_DIR);
+  },
+  filename: (req, file, cb) => {
+    cb(null, safeFileName(file.originalname));
+  },
+});
 
 const upload = multer({
-  dest: uploadDir,
+  storage,
   limits: {
-    fileSize: 50 * 1024 * 1024
-  }
+    fileSize: 50 * 1024 * 1024,
+    files: 20,
+  },
 });
 
-const allowedExtensions = [
-  ".doc", ".docx",
-  ".xls", ".xlsx",
-  ".ppt", ".pptx",
-  ".odt", ".ods", ".odp"
-];
-
-const libreOfficePaths = [
-  process.env.LIBREOFFICE_PATH,
-  "soffice",
-  "/usr/bin/soffice",
-  "/usr/lib/libreoffice/program/soffice",
-  "C:\\Program Files\\LibreOffice\\program\\soffice.exe",
-  "C:\\Program Files (x86)\\LibreOffice\\program\\soffice.exe"
-].filter(Boolean);
-
-function safeDelete(filePath) {
-  try {
-    if (fs.existsSync(filePath)) {
-      fs.unlinkSync(filePath);
-    }
-  } catch (error) {
-    console.log("Gagal hapus file:", filePath);
-  }
-}
-
-function cleanOldFiles(folder, maxAgeMinutes = 30) {
-  if (!fs.existsSync(folder)) return;
-
-  const now = Date.now();
-  const maxAge = maxAgeMinutes * 60 * 1000;
-
-  fs.readdirSync(folder).forEach((file) => {
-    const filePath = path.join(folder, file);
-    const stat = fs.statSync(filePath);
-
-    if (now - stat.mtimeMs > maxAge) {
-      safeDelete(filePath);
-    }
-  });
-}
-
-function convertWithLibreOffice(inputPath, outputDir) {
+function convertToPdf(inputPath) {
   return new Promise((resolve, reject) => {
-    let index = 0;
+    const beforeFiles = new Set(fs.readdirSync(CONVERTED_DIR));
 
-    function tryNextPath() {
-      if (index >= libreOfficePaths.length) {
-        return reject(new Error("LibreOffice tidak ditemukan. Cek path soffice.exe."));
+    const args = [
+      '--headless',
+      '--nologo',
+      '--nofirststartwizard',
+      '--convert-to',
+      'pdf',
+      '--outdir',
+      CONVERTED_DIR,
+      inputPath,
+    ];
+
+    execFile(LIBREOFFICE_PATH, args, { timeout: 120000 }, (error, stdout, stderr) => {
+      if (error) {
+        return reject(
+          new Error(
+            `LibreOffice conversion failed: ${stderr || stdout || error.message}`
+          )
+        );
       }
 
-      const libreOfficePath = libreOfficePaths[index];
+      const afterFiles = fs.readdirSync(CONVERTED_DIR);
+      const newPdf = afterFiles.find((file) => {
+        return !beforeFiles.has(file) && file.toLowerCase().endsWith('.pdf');
+      });
 
-      console.log("Mencoba LibreOffice:", libreOfficePath);
-      console.log("Input:", inputPath);
-      console.log("Output:", outputDir);
+      if (!newPdf) {
+        const inputBase = path.basename(inputPath, path.extname(inputPath));
+        const expectedPdf = `${inputBase}.pdf`;
+        const expectedPath = path.join(CONVERTED_DIR, expectedPdf);
 
-      execFile(
-        libreOfficePath,
-        [
-          "--headless",
-          "--convert-to",
-          "pdf",
-          "--outdir",
-          outputDir,
-          inputPath
-        ],
-        (error, stdout, stderr) => {
-          if (error) {
-            console.log("Gagal dengan path:", libreOfficePath);
-            console.log("Error:", error.message);
-            console.log("STDERR:", stderr);
-
-            index++;
-            tryNextPath();
-            return;
-          }
-
-          console.log("STDOUT:", stdout);
-          console.log("STDERR:", stderr);
-
-          resolve();
+        if (fs.existsSync(expectedPath)) {
+          return resolve(expectedPdf);
         }
-      );
-    }
 
-    tryNextPath();
+        return reject(new Error('PDF file was not created.'));
+      }
+
+      resolve(newPdf);
+    });
   });
 }
 
+function cleanupFile(filePath) {
+  fs.unlink(filePath, () => {});
+}
 
-app.get("/health", (req, res) => {
+app.get('/health', (req, res) => {
   res.json({
-    status: "ok",
-    name: "PDF Converter API",
-    libreOffice: libreOfficePaths[0] || "auto"
+    status: 'ok',
+    name: 'PDF Converter API',
+    port: PORT,
+    libreOffice: LIBREOFFICE_PATH,
   });
 });
 
-app.post("/convert-multiple", upload.array("files", 20), async (req, res) => {
-  cleanOldFiles(uploadDir);
-  cleanOldFiles(outputDir);
-
-  if (!req.files || req.files.length === 0) {
-    return res.status(400).send("Tidak ada file yang diupload.");
-  }
-
-  const uploadedFiles = [];
-  const convertedFiles = [];
-
+app.post('/convert', upload.any(), async (req, res) => {
   try {
-    for (const file of req.files) {
-      const originalName = file.originalname;
-      const ext = path.extname(originalName).toLowerCase();
+    const files = req.files || [];
 
-      if (!allowedExtensions.includes(ext)) {
-        safeDelete(file.path);
-        continue;
+    if (!files.length) {
+      return res.status(400).json({
+        success: false,
+        message: 'No files uploaded.',
+      });
+    }
+
+    const results = [];
+
+    for (const file of files) {
+      const inputPath = file.path;
+      const ext = path.extname(file.originalname).toLowerCase();
+
+      try {
+        if (ext === '.pdf') {
+          const pdfName = safeFileName(file.originalname);
+          const pdfPath = path.join(CONVERTED_DIR, pdfName);
+          fs.copyFileSync(inputPath, pdfPath);
+
+          results.push({
+            originalName: file.originalname,
+            fileName: pdfName,
+            downloadUrl: `/download/${pdfName}`,
+          });
+        } else {
+          const pdfName = await convertToPdf(inputPath);
+
+          results.push({
+            originalName: file.originalname,
+            fileName: pdfName,
+            downloadUrl: `/download/${pdfName}`,
+          });
+        }
+      } finally {
+        cleanupFile(inputPath);
       }
-
-      const safeOriginalName = originalName.replace(/[^\w.\-() ]/g, "_");
-      const inputFileName = `${Date.now()}-${file.filename}-${safeOriginalName}`;
-      const inputPath = path.join(uploadDir, inputFileName);
-
-      fs.renameSync(file.path, inputPath);
-      uploadedFiles.push(inputPath);
-
-      await convertWithLibreOffice(inputPath, outputDir);
-
-      const expectedPdfName = path.basename(inputFileName, ext) + ".pdf";
-      const expectedPdfPath = path.join(outputDir, expectedPdfName);
-
-      if (!fs.existsSync(expectedPdfPath)) {
-        throw new Error("PDF tidak ditemukan setelah proses convert.");
-      }
-
-      const finalPdfName = originalName.replace(ext, ".pdf");
-      const finalPdfPath = path.join(outputDir, `${Date.now()}-${file.filename}-${finalPdfName}`);
-
-      fs.renameSync(expectedPdfPath, finalPdfPath);
-
-      convertedFiles.push({
-        path: finalPdfPath,
-        name: finalPdfName
-      });
     }
 
-    uploadedFiles.forEach(safeDelete);
-
-    if (convertedFiles.length === 0) {
-      return res.status(400).send("Tidak ada file yang berhasil dikonversi.");
-    }
-
-    if (convertedFiles.length === 1) {
-      const singleFile = convertedFiles[0];
-
-      return res.download(singleFile.path, singleFile.name, () => {
-        safeDelete(singleFile.path);
-      });
-    }
-
-    const zipName = "hasil-convert-pdf.zip";
-    const zipPath = path.join(outputDir, `${Date.now()}-${zipName}`);
-
-    const output = fs.createWriteStream(zipPath);
-    const archive = archiver("zip", {
-      zlib: { level: 9 }
+    res.json({
+      success: true,
+      count: results.length,
+      files: results,
     });
-
-    output.on("close", () => {
-      convertedFiles.forEach((file) => safeDelete(file.path));
-
-      res.download(zipPath, zipName, () => {
-        safeDelete(zipPath);
-      });
-    });
-
-    archive.on("error", (error) => {
-      throw error;
-    });
-
-    archive.pipe(output);
-
-    convertedFiles.forEach((file) => {
-      archive.file(file.path, { name: file.name });
-    });
-
-    archive.finalize();
-
   } catch (error) {
-    console.error("ERROR CONVERT:", error.message);
+    console.error('Convert error:', error);
 
-    if (req.files) {
-      req.files.forEach((file) => safeDelete(file.path));
-    }
-
-    uploadedFiles.forEach(safeDelete);
-    convertedFiles.forEach((file) => safeDelete(file.path));
-
-    res.status(500).send(error.message || "Terjadi kesalahan saat convert dokumen.");
+    res.status(500).json({
+      success: false,
+      message: 'Failed to convert file.',
+      error: error.message,
+    });
   }
 });
 
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`Server berjalan di http://0.0.0.0:${PORT}`);
+app.get('/download/:filename', (req, res) => {
+  const filename = path.basename(req.params.filename);
+  const filePath = path.join(CONVERTED_DIR, filename);
+
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).send('File not found.');
+  }
+
+  res.download(filePath, filename);
+});
+
+app.get('*', (req, res) => {
+  const indexPath = path.join(PUBLIC_DIR, 'index.html');
+
+  if (fs.existsSync(indexPath)) {
+    return res.sendFile(indexPath);
+  }
+
+  res.send('PDF Converter is running.');
+});
+
+app.listen(PORT, HOST, () => {
+  console.log(`PDF Converter running on http://${HOST}:${PORT}`);
 });

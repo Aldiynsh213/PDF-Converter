@@ -1,24 +1,27 @@
-FROM node:20-bookworm-slim
+FROM node:20-bookworm
 
 WORKDIR /app
 
-# LibreOffice is required for DOC/DOCX/XLS/XLSX/PPT/PPTX to PDF conversion.
-# Fonts improve rendering quality for documents.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update && apt-get install -y \
     libreoffice \
+    libreoffice-writer \
+    libreoffice-calc \
+    libreoffice-impress \
     fonts-dejavu \
     fonts-liberation \
-    fontconfig \
     && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
-RUN npm ci --omit=dev
+RUN npm install --production
 
 COPY . .
 
+RUN mkdir -p uploads converted
+
 ENV NODE_ENV=production
+ENV PORT=7860
 ENV LIBREOFFICE_PATH=soffice
 
-EXPOSE 3000
+EXPOSE 7860
 
 CMD ["npm", "start"]
