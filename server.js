@@ -4,6 +4,7 @@ const path = require('path');
 const fs = require('fs');
 const { execFile } = require('child_process');
 const crypto = require('crypto');
+const archiver = require('archiver');
 
 const app = express();
 
@@ -21,9 +22,7 @@ fs.mkdirSync(CONVERTED_DIR, { recursive: true });
 
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-
 app.use(express.static(PUBLIC_DIR));
-app.use('/converted', express.static(CONVERTED_DIR));
 
 function safeFileName(name) {
   const ext = path.extname(name);
@@ -31,19 +30,16 @@ function safeFileName(name) {
     .basename(name, ext)
     .replace(/[^a-zA-Z0-9-_]/g, '-')
     .replace(/-+/g, '-')
-    .slice(0, 60);
+    .replace(/^-|-$/g, '')
+    .slice(0, 80);
 
-  const id = crypto.randomBytes(6).toString('hex');
+  const id = crypto.randomBytes(5).toString('hex');
   return `${base || 'file'}-${id}${ext}`;
 }
 
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, UPLOAD_DIR);
-  },
-  filename: (req, file, cb) => {
-    cb(null, safeFileName(file.originalname));
-  },
+  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+  filename: (req, file, cb) => cb(null, safeFileName(file.originalname)),
 });
 
 const upload = multer({
@@ -54,9 +50,15 @@ const upload = multer({
   },
 });
 
+function cleanup(filePath) {
+  fs.unlink(filePath, () => {});
+}
+
 function convertToPdf(inputPath) {
   return new Promise((resolve, reject) => {
-    const beforeFiles = new Set(fs.readdirSync(CONVERTED_DIR));
+    const inputBase = path.basename(inputPath, path.extname(inputPath));
+    const expectedPdf = `${inputBase}.pdf`;
+    const expectedPath = path.join(CONVERTED_DIR, expectedPdf);
 
     const args = [
       '--headless',
@@ -72,36 +74,17 @@ function convertToPdf(inputPath) {
     execFile(LIBREOFFICE_PATH, args, { timeout: 120000 }, (error, stdout, stderr) => {
       if (error) {
         return reject(
-          new Error(
-            `LibreOffice conversion failed: ${stderr || stdout || error.message}`
-          )
+          new Error(stderr || stdout || error.message || 'LibreOffice conversion failed')
         );
       }
 
-      const afterFiles = fs.readdirSync(CONVERTED_DIR);
-      const newPdf = afterFiles.find((file) => {
-        return !beforeFiles.has(file) && file.toLowerCase().endsWith('.pdf');
-      });
-
-      if (!newPdf) {
-        const inputBase = path.basename(inputPath, path.extname(inputPath));
-        const expectedPdf = `${inputBase}.pdf`;
-        const expectedPath = path.join(CONVERTED_DIR, expectedPdf);
-
-        if (fs.existsSync(expectedPath)) {
-          return resolve(expectedPdf);
-        }
-
-        return reject(new Error('PDF file was not created.'));
+      if (!fs.existsSync(expectedPath)) {
+        return reject(new Error('PDF output was not created.'));
       }
 
-      resolve(newPdf);
+      resolve(expectedPath);
     });
   });
-}
-
-function cleanupFile(filePath) {
-  fs.unlink(filePath, () => {});
 }
 
 app.get('/health', (req, res) => {
@@ -114,72 +97,89 @@ app.get('/health', (req, res) => {
 });
 
 app.post('/convert', upload.any(), async (req, res) => {
-  try {
-    const files = req.files || [];
+  const uploadedFiles = req.files || [];
+  const outputFiles = [];
 
-    if (!files.length) {
-      return res.status(400).json({
-        success: false,
-        message: 'No files uploaded.',
+  try {
+    if (!uploadedFiles.length) {
+      return res.status(400).send('No files uploaded.');
+    }
+
+    for (const file of uploadedFiles) {
+      const inputPath = file.path;
+      const originalExt = path.extname(file.originalname).toLowerCase();
+
+      if (originalExt === '.pdf') {
+        const pdfName = safeFileName(file.originalname);
+        const pdfPath = path.join(CONVERTED_DIR, pdfName);
+        fs.copyFileSync(inputPath, pdfPath);
+        outputFiles.push({
+          path: pdfPath,
+          name: pdfName,
+        });
+      } else {
+        const pdfPath = await convertToPdf(inputPath);
+        const cleanName =
+          path.basename(file.originalname, path.extname(file.originalname))
+            .replace(/[^a-zA-Z0-9-_]/g, '-')
+            .replace(/-+/g, '-')
+            .replace(/^-|-$/g, '')
+            .slice(0, 80) + '.pdf';
+
+        outputFiles.push({
+          path: pdfPath,
+          name: cleanName,
+        });
+      }
+
+      cleanup(inputPath);
+    }
+
+    if (outputFiles.length === 1) {
+      const file = outputFiles[0];
+
+      res.setHeader('Content-Type', 'application/pdf');
+      res.setHeader(
+        'Content-Disposition',
+        `attachment; filename="${file.name}"`
+      );
+
+      return res.download(file.path, file.name, (err) => {
+        cleanup(file.path);
+        if (err) console.error('Download error:', err);
       });
     }
 
-    const results = [];
+    const zipName = `converted-files-${Date.now()}.zip`;
 
-    for (const file of files) {
-      const inputPath = file.path;
-      const ext = path.extname(file.originalname).toLowerCase();
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${zipName}"`);
 
-      try {
-        if (ext === '.pdf') {
-          const pdfName = safeFileName(file.originalname);
-          const pdfPath = path.join(CONVERTED_DIR, pdfName);
-          fs.copyFileSync(inputPath, pdfPath);
+    const archive = archiver('zip', { zlib: { level: 9 } });
 
-          results.push({
-            originalName: file.originalname,
-            fileName: pdfName,
-            downloadUrl: `/download/${pdfName}`,
-          });
-        } else {
-          const pdfName = await convertToPdf(inputPath);
-
-          results.push({
-            originalName: file.originalname,
-            fileName: pdfName,
-            downloadUrl: `/download/${pdfName}`,
-          });
-        }
-      } finally {
-        cleanupFile(inputPath);
-      }
-    }
-
-    res.json({
-      success: true,
-      count: results.length,
-      files: results,
+    archive.on('error', (err) => {
+      throw err;
     });
+
+    archive.on('end', () => {
+      outputFiles.forEach((file) => cleanup(file.path));
+    });
+
+    archive.pipe(res);
+
+    outputFiles.forEach((file) => {
+      archive.file(file.path, { name: file.name });
+    });
+
+    archive.finalize();
   } catch (error) {
+    uploadedFiles.forEach((file) => cleanup(file.path));
+    outputFiles.forEach((file) => cleanup(file.path));
+
     console.error('Convert error:', error);
 
-    res.status(500).json({
-      success: false,
-      message: 'Failed to convert file.',
-      error: error.message,
-    });
+    res.status(500).send(`Failed to convert file: ${error.message}`);
   }
-});
-
-app.get('/download/:filename', (req, res) => {
-  const filename = path.basename(req.params.filename);
-  const filePath = path.join(CONVERTED_DIR, filename);
-
-  if (!fs.existsSync(filePath)) {
-    return res.status(404).send('File not found.');
-  }
-
-  res.download(filePath, filename);
 });
 
 app.use((req, res) => {
