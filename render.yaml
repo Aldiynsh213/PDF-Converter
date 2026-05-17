@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: pdf-converter
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: LIBREOFFICE_PATH
+        value: soffice
