@@ -182,7 +182,7 @@ app.get('/download/:filename', (req, res) => {
   res.download(filePath, filename);
 });
 
-app.get('*', (req, res) => {
+app.use((req, res) => {
   const indexPath = path.join(PUBLIC_DIR, 'index.html');
 
   if (fs.existsSync(indexPath)) {
